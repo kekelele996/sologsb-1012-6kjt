@@ -15,6 +15,22 @@ import {
   type LessonStep,
   type ValidationCheck,
 } from '../../models';
+import {
+  PRACTICE_STORAGE_KEY,
+  emptyPracticeStore,
+  finalizeActive,
+  getActiveSession,
+  getFinishedSessions,
+  loadPracticeStore,
+  removeStepRecords,
+  setCheckpointHint,
+  setCheckpointVerdict,
+  startPractice,
+  summarizeSession,
+  type CheckpointVerdict,
+  type PracticeSession,
+  type PracticeStore,
+} from '../../practice';
 
 type PreviewSize = 'phone' | 'tablet';
 
@@ -31,6 +47,7 @@ export class AppRoot {
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  @State() practiceStore: PracticeStore = emptyPracticeStore();
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
@@ -42,6 +59,7 @@ export class AppRoot {
     } catch {
       this.project = createDemoProject();
     }
+    this.practiceStore = loadPracticeStore();
   }
 
   disconnectedCallback(): void {
@@ -101,6 +119,78 @@ export class AppRoot {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
 
+  private savePractice(store: PracticeStore): void {
+    this.practiceStore = store;
+    localStorage.setItem(PRACTICE_STORAGE_KEY, JSON.stringify(store));
+  }
+
+  private get activePractice(): PracticeSession | undefined {
+    return this.currentStep ? getActiveSession(this.practiceStore, this.currentStep.id) : undefined;
+  }
+
+  private get finishedPractices(): PracticeSession[] {
+    return this.currentStep ? getFinishedSessions(this.practiceStore, this.currentStep.id) : [];
+  }
+
+  private startPracticeSession(): void {
+    const step = this.currentStep;
+    if (!step) return;
+    if (!step.cuePoints.length) {
+      this.showToast('warning', '该步骤还没有检查点，请先在步骤编排中添加检查点时间。');
+      return;
+    }
+    if (this.activePractice) {
+      this.showToast('medium', '当前步骤已有进行中的练习，可继续记录。');
+      return;
+    }
+    this.savePractice(startPractice(this.practiceStore, this.currentModule.id, step, new Date().toISOString()));
+    this.showToast('success', '练习已开始，按检查点记录结果和当堂提示。');
+  }
+
+  private markCheckpoint(index: number, verdict: CheckpointVerdict): void {
+    const stepId = this.currentStep?.id;
+    if (!stepId) return;
+    this.savePractice(setCheckpointVerdict(this.practiceStore, stepId, index, verdict));
+  }
+
+  private updateCheckpointHint(index: number, hint: string): void {
+    const stepId = this.currentStep?.id;
+    if (!stepId) return;
+    this.savePractice(setCheckpointHint(this.practiceStore, stepId, index, hint));
+  }
+
+  /** 结束当前步骤未结束的练习记录，返回刚结束的记录（没有则 undefined） */
+  private endActivePractice(): PracticeSession | undefined {
+    const stepId = this.currentStep?.id;
+    if (!stepId) return undefined;
+    const result = finalizeActive(this.practiceStore, stepId, new Date().toISOString());
+    if (!result.session) return undefined;
+    this.savePractice(result.store);
+    return result.session;
+  }
+
+  private finishPractice(): void {
+    const ended = this.endActivePractice();
+    if (!ended) {
+      this.showToast('medium', '当前步骤没有进行中的练习。');
+      return;
+    }
+    const { pass, reinforce, pending } = summarizeSession(ended);
+    const tail = pending ? `，${pending} 个检查点未记录` : '';
+    this.showToast('success', `练习已结束：通过 ${pass} 个、待加强 ${reinforce} 个${tail}，已计入最近五次记录。`);
+  }
+
+  /**
+   * 步骤内容或检查点被改动前，先结束该步骤进行中的练习记录，
+   * 让记录锁定在开始时的检查点快照上，旧结果不会贴到新内容。
+   */
+  private autoFinishBeforeEdit(): void {
+    const ended = this.endActivePractice();
+    if (ended) {
+      this.showToast('warning', '检测到步骤内容调整，已先结束进行中的练习记录；可在结束后重新开始练习。');
+    }
+  }
+
   private commit(update: (draft: CourseProject) => CourseProject, toast?: string): void {
     if (this.project.status === 'frozen') {
       this.showToast('warning', '当前版本已冻结，请先创建修订版。');
@@ -154,6 +244,7 @@ export class AppRoot {
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
+    if (this.project.status !== 'frozen') this.autoFinishBeforeEdit();
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
@@ -240,6 +331,7 @@ export class AppRoot {
       } : module),
       selectedStepId: this.currentModule.steps.find((step) => step.id !== stepId)?.id ?? '',
     }), '已删除学习步骤。');
+    this.savePractice(removeStepRecords(this.practiceStore, stepId));
   }
 
   private moveStep(direction: number): void {
@@ -507,7 +599,129 @@ export class AppRoot {
             <p class="preview-caption-text">{step.caption}</p>
           </div>
         ) : <div class="empty-preview">选择步骤后显示设备预览。</div>}
+        {step && this.renderPractice()}
       </section>
+    );
+  }
+
+  private renderCheckpointRow(mark: { cue: number; verdict?: CheckpointVerdict; hint: string }, index: number, editable: boolean) {
+    const verdict = mark.verdict;
+    return (
+      <div class={`checkpoint-row ${verdict ? `is-${verdict}` : ''}`} key={`${mark.cue}-${index}`}>
+        <div class="checkpoint-head">
+          <span class="checkpoint-cue">{String(index + 1).padStart(2, '0')} · {mark.cue}s</span>
+          <div class="verdict-toggle">
+            <button
+              class={verdict === 'pass' ? 'active pass' : 'pass'}
+              disabled={!editable}
+              onClick={() => this.markCheckpoint(index, 'pass')}
+            >通过</button>
+            <button
+              class={verdict === 'reinforce' ? 'active reinforce' : 'reinforce'}
+              disabled={!editable}
+              onClick={() => this.markCheckpoint(index, 'reinforce')}
+            >待加强</button>
+          </div>
+        </div>
+        {editable ? (
+          <input
+            class="hint-input"
+            type="text"
+            maxlength="80"
+            placeholder="写一句当堂提示，例如：手腕再压低一点（选填）"
+            value={mark.hint}
+            onInput={(event) => this.updateCheckpointHint(index, (event.target as HTMLInputElement).value)}
+          />
+        ) : (
+          mark.hint ? <p class="hint-record">提示：{mark.hint}</p> : <p class="hint-record empty">未写当堂提示</p>
+        )}
+      </div>
+    );
+  }
+
+  private renderActivePractice(session: PracticeSession) {
+    const marked = session.checkpoints.filter((mark) => mark.verdict).length;
+    return (
+      <div class="practice-card live">
+        <div class="practice-card-head">
+          <div>
+            <span class="eyebrow">步骤练习记录</span>
+            <h3>练习进行中</h3>
+            <p>开始于 {this.formatDate(session.startedAt)} · 已标记 {marked} / {session.checkpoints.length} 个检查点</p>
+          </div>
+          <span class="practice-live-dot">进行中</span>
+        </div>
+        <div class="practice-checkpoint-list">
+          {session.checkpoints.map((mark, index) => this.renderCheckpointRow(mark, index, true))}
+        </div>
+        <div class="practice-card-foot">
+          <p>每个检查点可重复标记，以最后一次为准。</p>
+          <ion-button size="small" color="primary" class="studio-button" onClick={() => this.finishPractice()}>结束本次练习</ion-button>
+        </div>
+      </div>
+    );
+  }
+
+  private renderFinishedSession(session: PracticeSession, index: number) {
+    const summary = summarizeSession(session);
+    const badgeClass = summary.pending > 0 ? 'reinforce' : summary.reinforce > 0 ? 'reinforce' : 'pass';
+    return (
+      <div class="practice-history-item" key={session.id}>
+        <div class="history-head">
+          <strong>第 {index + 1} 次记录</strong>
+          <span class={`history-badge ${badgeClass}`}>{summary.pass} 通过 · {summary.reinforce} 待加强{summary.pending ? ` · ${summary.pending} 未记录` : ''}</span>
+          <small>{this.formatDate(session.endedAt!)} · {session.duration}s 版本</small>
+        </div>
+        <div class="history-checkpoints">
+          {session.checkpoints.map((mark, i) => {
+            const label = mark.verdict === 'pass' ? '通过' : mark.verdict === 'reinforce' ? '待加强' : '未记录';
+            return (
+              <div class={`history-checkpoint ${mark.verdict ?? 'pending'}`} key={`${mark.cue}-${i}`}>
+                <span class="history-cue">{mark.cue}s</span>
+                <span class={`history-verdict ${mark.verdict ?? 'pending'}`}>{label}</span>
+                <span class="history-hint">{mark.hint || '—'}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  private renderPractice() {
+    const step = this.currentStep;
+    if (!step) return null;
+    const active = this.activePractice;
+    const finished = this.finishedPractices;
+    return (
+      <div class="practice-card">
+        <div class="practice-card-head static">
+          <div>
+            <span class="eyebrow">步骤练习记录</span>
+            <h3>当堂检查点记录</h3>
+            <p>开始后逐个检查点记录结果，数据保存在本机，切换步骤或重开页面都能继续查看。</p>
+          </div>
+          {!active && (
+            <ion-button
+              size="small"
+              fill="outline"
+              class="studio-button"
+              disabled={!step.cuePoints.length}
+              onClick={() => this.startPracticeSession()}
+            >{finished.length ? '再练一次' : '开始练习'}</ion-button>
+          )}
+        </div>
+        {!step.cuePoints.length && (
+          <p class="practice-no-cue">该步骤还没有检查点，请先在「步骤编排 → 检查点」中设置时间。</p>
+        )}
+        {active && this.renderActivePractice(active)}
+        <div class="practice-history">
+          <div class="history-title"><strong>最近五次记录</strong><span>{finished.length} / 5</span></div>
+          {finished.length === 0
+            ? <p class="history-empty">还没有已结束的练习记录。</p>
+            : finished.map((session, index) => this.renderFinishedSession(session, index))}
+        </div>
+      </div>
     );
   }
 
