@@ -1,9 +1,21 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
+  activePractice,
+  canFinishPractice,
   cloneProject,
   createDemoProject,
+  createEmptyPracticeStore,
+  discardPractice,
+  finishPractice,
+  hasAnyActivePractice,
+  PRACTICE_STORAGE_KEY,
+  practiceHistory,
+  removeStepPractice,
   selectedModule,
   selectedStep,
+  setCheckpointResult,
+  setCheckpointTip,
+  startPractice,
   STORAGE_KEY,
   validateProject,
   type CameraAngle,
@@ -13,6 +25,8 @@ import {
   type Difficulty,
   type GestureZone,
   type LessonStep,
+  type PracticeSession,
+  type PracticeStore,
   type ValidationCheck,
 } from '../../models';
 
@@ -25,6 +39,7 @@ type PreviewSize = 'phone' | 'tablet';
 })
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
+  @State() practiceStore: PracticeStore = createEmptyPracticeStore();
   @State() previewSize: PreviewSize = 'phone';
   @State() activePanel: 'editor' | 'checks' = 'editor';
   @State() playing = false;
@@ -41,6 +56,12 @@ export class AppRoot {
       if (saved) this.project = JSON.parse(saved) as CourseProject;
     } catch {
       this.project = createDemoProject();
+    }
+    try {
+      const savedPractice = localStorage.getItem(PRACTICE_STORAGE_KEY);
+      if (savedPractice) this.practiceStore = JSON.parse(savedPractice) as PracticeStore;
+    } catch {
+      this.practiceStore = createEmptyPracticeStore();
     }
   }
 
@@ -97,6 +118,81 @@ export class AppRoot {
     return validateProject(this.project);
   }
 
+  private get currentPractice(): PracticeSession | undefined {
+    return this.currentStep ? activePractice(this.practiceStore, this.currentStep.id) : undefined;
+  }
+
+  private get practiceRecords(): PracticeSession[] {
+    return this.currentStep ? practiceHistory(this.practiceStore, this.currentStep.id) : [];
+  }
+
+  private get anyPracticeActive(): boolean {
+    return hasAnyActivePractice(this.practiceStore);
+  }
+
+  private isStepPracticing(stepId: string): boolean {
+    return Boolean(activePractice(this.practiceStore, stepId));
+  }
+
+  private persistPractice(store: PracticeStore): void {
+    this.practiceStore = store;
+    localStorage.setItem(PRACTICE_STORAGE_KEY, JSON.stringify(store));
+  }
+
+  private beginPractice(): void {
+    const step = this.currentStep;
+    if (!step) return;
+    if (this.isStepPracticing(step.id)) {
+      this.showToast('medium', '这一步的练习记录还在进行中，可直接继续。');
+      return;
+    }
+    if (!step.cuePoints.length) {
+      this.showToast('warning', '这一步还没有检查点，请先在「学习依赖与练习」中添加检查点秒数。');
+      return;
+    }
+    this.persistPractice(startPractice(this.practiceStore, step));
+    this.showToast('success', '练习已开始，逐个检查点记录当堂结果。');
+  }
+
+  private markCheckpoint(index: number, result: 'pass' | 'weak'): void {
+    const step = this.currentStep;
+    if (!step || !this.currentPractice) return;
+    // 重复记录以最后一次为准：直接覆盖为本次结果（通过 → 待加强 点另一个按钮即可）
+    this.persistPractice(setCheckpointResult(this.practiceStore, step.id, index, result));
+  }
+
+  private updateCheckpointTip(index: number, tip: string): void {
+    const step = this.currentStep;
+    if (!step || !this.currentPractice) return;
+    this.persistPractice(setCheckpointTip(this.practiceStore, step.id, index, tip));
+  }
+
+  private endPractice(): void {
+    const step = this.currentStep;
+    const session = this.currentPractice;
+    if (!step || !session) return;
+    if (!canFinishPractice(session)) {
+      const unmarked = session.checkpoints.filter((checkpoint) => checkpoint.result === null).length;
+      const missingTip = session.checkpoints.filter((checkpoint) => checkpoint.result === 'weak' && !checkpoint.tip.trim()).length;
+      this.showToast('warning', unmarked
+        ? `还有 ${unmarked} 个检查点未记录结果。`
+        : missingTip
+          ? `还有 ${missingTip} 个「待加强」检查点缺少当堂提示。`
+          : '完成所有检查点后才能结束。');
+      return;
+    }
+    this.persistPractice(finishPractice(this.practiceStore, step.id));
+    this.showToast('success', '练习记录已结束，仅保留最近五次。');
+  }
+
+  private abortPractice(): void {
+    const step = this.currentStep;
+    if (!step || !this.currentPractice) return;
+    if (!window.confirm('放弃后本次未结束的记录将被删除，确定继续吗？')) return;
+    this.persistPractice(discardPractice(this.practiceStore, step.id));
+    this.showToast('medium', '本次练习记录已放弃。');
+  }
+
   private persist(): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
@@ -118,6 +214,10 @@ export class AppRoot {
   }
 
   private undo(): void {
+    if (this.anyPracticeActive) {
+      this.showToast('warning', '练习记录进行中，请先结束或放弃记录后再撤销，避免旧结果贴到新内容。');
+      return;
+    }
     const previous = this.past.pop();
     if (!previous) return this.showToast('medium', '没有可撤销的修改。');
     this.future = [cloneProject(this.project), ...this.future].slice(0, 80);
@@ -126,6 +226,10 @@ export class AppRoot {
   }
 
   private redo(): void {
+    if (this.anyPracticeActive) {
+      this.showToast('warning', '练习记录进行中，请先结束或放弃记录后再重做。');
+      return;
+    }
     const next = this.future.shift();
     if (!next) return;
     this.past = [...this.past, cloneProject(this.project)].slice(-80);
@@ -154,6 +258,10 @@ export class AppRoot {
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
+    if (this.isStepPracticing(stepId)) {
+      this.showToast('warning', '这一步的练习记录进行中，请先到右侧预览结束或放弃记录，再修改内容或检查点。');
+      return;
+    }
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
@@ -232,6 +340,10 @@ export class AppRoot {
       this.showToast('warning', '模块至少保留一个学习步骤。');
       return;
     }
+    if (this.isStepPracticing(stepId)) {
+      this.showToast('warning', '这一步的练习记录进行中，请先结束或放弃记录后再删除。');
+      return;
+    }
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
@@ -240,6 +352,7 @@ export class AppRoot {
       } : module),
       selectedStepId: this.currentModule.steps.find((step) => step.id !== stepId)?.id ?? '',
     }), '已删除学习步骤。');
+    this.persistPractice(removeStepPractice(this.practiceStore, stepId));
   }
 
   private moveStep(direction: number): void {
@@ -342,6 +455,7 @@ export class AppRoot {
   private renderStepListItem(step: LessonStep, index: number) {
     const active = step.id === this.currentStep?.id;
     const issueCount = this.checks.filter((check) => check.stepId === step.id && check.severity !== 'info').length;
+    const practicing = this.isStepPracticing(step.id);
     return (
       <button class={`step-list-item ${active ? 'active' : ''}`} onClick={() => this.selectStep(step.id)}>
         <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
@@ -349,7 +463,9 @@ export class AppRoot {
           <strong>{step.title}</strong>
           <small>{step.kind} · {step.duration}s · {step.difficulty}</small>
         </span>
-        {issueCount > 0 && <span class="step-issue-count">{issueCount}</span>}
+        {practicing
+          ? <span class="step-practice-flag" title="练习记录进行中">练</span>
+          : issueCount > 0 && <span class="step-issue-count">{issueCount}</span>}
       </button>
     );
   }
@@ -367,6 +483,7 @@ export class AppRoot {
       );
     }
     const frozen = this.project.status === 'frozen';
+    const practicing = this.isStepPracticing(step.id);
     const module = this.currentModule;
     const prerequisites = module.steps.filter((candidate, index) => candidate.id !== step.id && index < module.steps.findIndex((item) => item.id === step.id));
     return (
@@ -381,9 +498,16 @@ export class AppRoot {
             <ion-button fill="clear" class="studio-button" onClick={() => this.moveStep(-1)} title="Alt + ↑">上移</ion-button>
             <ion-button fill="clear" class="studio-button" onClick={() => this.moveStep(1)} title="Alt + ↓">下移</ion-button>
             <ion-button fill="outline" class="studio-button" onClick={() => this.duplicateStep()}>复制</ion-button>
-            <ion-button fill="outline" color="danger" class="studio-button" onClick={() => this.deleteStep(step.id)}>删除</ion-button>
+            <ion-button fill="outline" color="danger" class="studio-button" disabled={practicing} onClick={() => this.deleteStep(step.id)}>删除</ion-button>
           </div>
         </div>
+
+        {practicing && (
+          <div class="practice-lock-callout">
+            <div><strong>练习记录进行中，内容已锁定</strong><span>为避免旧结果贴到新内容，请先在右侧「练习记录」结束或放弃本次记录，再修改步骤内容或检查点。</span></div>
+            <ion-button size="small" color="primary" class="studio-button" onClick={() => this.endPractice()}>结束记录</ion-button>
+          </div>
+        )}
 
         {frozen && (
           <div class="frozen-callout">
@@ -395,16 +519,16 @@ export class AppRoot {
         <section class="form-card">
           <div class="section-title"><span>01</span><div><h2>基础设计</h2><p>标题、类型、难度和预计时长</p></div></div>
           <div class="form-grid two">
-            <ion-input disabled={frozen} label="步骤标题" labelPlacement="stacked" class="studio-input" value={step.title} onIonInput={(event) => this.updateStep({ title: event.detail.value ?? '' })} />
-            <ion-select disabled={frozen} label="步骤类型" labelPlacement="stacked" class="studio-input" value={step.kind} onIonChange={(event) => this.updateStep({ kind: event.detail.value as LessonStep['kind'] })}>
+            <ion-input disabled={frozen || practicing} label="步骤标题" labelPlacement="stacked" class="studio-input" value={step.title} onIonInput={(event) => this.updateStep({ title: event.detail.value ?? '' })} />
+            <ion-select disabled={frozen || practicing} label="步骤类型" labelPlacement="stacked" class="studio-input" value={step.kind} onIonChange={(event) => this.updateStep({ kind: event.detail.value as LessonStep['kind'] })}>
               <ion-select-option value="示范">示范</ion-select-option>
               <ion-select-option value="讲解">讲解</ion-select-option>
               <ion-select-option value="练习">练习</ion-select-option>
             </ion-select>
-            <ion-select disabled={frozen} label="难度标签" labelPlacement="stacked" class="studio-input" value={step.difficulty} onIonChange={(event) => this.updateStep({ difficulty: event.detail.value as Difficulty })}>
+            <ion-select disabled={frozen || practicing} label="难度标签" labelPlacement="stacked" class="studio-input" value={step.difficulty} onIonChange={(event) => this.updateStep({ difficulty: event.detail.value as Difficulty })}>
               {(['入门', '进阶', '挑战'] as Difficulty[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
             </ion-select>
-            <ion-input disabled={frozen} type="number" min="10" max="600" label="预计时长（秒）" labelPlacement="stacked" class="studio-input" value={String(step.duration)} onIonInput={(event) => this.updateStep({ duration: Number(event.detail.value) || 0 })} />
+            <ion-input disabled={frozen || practicing} type="number" min="10" max="600" label="预计时长（秒）" labelPlacement="stacked" class="studio-input" value={String(step.duration)} onIonInput={(event) => this.updateStep({ duration: Number(event.detail.value) || 0 })} />
           </div>
         </section>
 
@@ -417,46 +541,46 @@ export class AppRoot {
               <small>{step.camera}</small>
             </div>
             <div class="demo-fields">
-              <ion-input disabled={frozen} label="示范片段名称" labelPlacement="stacked" class="studio-input" value={step.demoTitle} onIonInput={(event) => this.updateStep({ demoTitle: event.detail.value ?? '' })} />
-              <ion-input disabled={frozen} label="本地素材地址（可空）" labelPlacement="stacked" class="studio-input" value={step.demoUrl} placeholder="例如 assets/hello.mp4" onIonInput={(event) => this.updateStep({ demoUrl: event.detail.value ?? '' })} />
+              <ion-input disabled={frozen || practicing} label="示范片段名称" labelPlacement="stacked" class="studio-input" value={step.demoTitle} onIonInput={(event) => this.updateStep({ demoTitle: event.detail.value ?? '' })} />
+              <ion-input disabled={frozen || practicing} label="本地素材地址（可空）" labelPlacement="stacked" class="studio-input" value={step.demoUrl} placeholder="例如 assets/hello.mp4" onIonInput={(event) => this.updateStep({ demoUrl: event.detail.value ?? '' })} />
             </div>
           </div>
           <div class="form-grid two">
-            <ion-select disabled={frozen} label="镜头角度" labelPlacement="stacked" class="studio-input" value={step.camera} onIonChange={(event) => this.updateStep({ camera: event.detail.value as CameraAngle })}>
+            <ion-select disabled={frozen || practicing} label="镜头角度" labelPlacement="stacked" class="studio-input" value={step.camera} onIonChange={(event) => this.updateStep({ camera: event.detail.value as CameraAngle })}>
               {(['正面', '左侧 45°', '右侧 45°', '俯拍手部', '全身远景'] as CameraAngle[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
             </ion-select>
-            <ion-select disabled={frozen} label="主要手形区域" labelPlacement="stacked" class="studio-input" value={step.gestureZone} onIonChange={(event) => this.updateStep({ gestureZone: event.detail.value as GestureZone })}>
+            <ion-select disabled={frozen || practicing} label="主要手形区域" labelPlacement="stacked" class="studio-input" value={step.gestureZone} onIonChange={(event) => this.updateStep({ gestureZone: event.detail.value as GestureZone })}>
               {(['左侧', '中央', '右侧'] as GestureZone[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
             </ion-select>
           </div>
-          <ion-textarea disabled={frozen} autoGrow label="手形说明" labelPlacement="stacked" class="studio-input" value={step.handshape} onIonInput={(event) => this.updateStep({ handshape: event.detail.value ?? '' })} />
+          <ion-textarea disabled={frozen || practicing} autoGrow label="手形说明" labelPlacement="stacked" class="studio-input" value={step.handshape} onIonInput={(event) => this.updateStep({ handshape: event.detail.value ?? '' })} />
         </section>
 
         <section class="form-card">
           <div class="section-title"><span>03</span><div><h2>字幕与无障碍</h2><p>检查字幕位置、动作遮挡与替代文本</p></div></div>
           <div class="form-grid two">
-            <ion-select disabled={frozen} label="字幕位置" labelPlacement="stacked" class="studio-input" value={step.captionPosition} onIonChange={(event) => this.updateStep({ captionPosition: event.detail.value as CaptionPosition })}>
+            <ion-select disabled={frozen || practicing} label="字幕位置" labelPlacement="stacked" class="studio-input" value={step.captionPosition} onIonChange={(event) => this.updateStep({ captionPosition: event.detail.value as CaptionPosition })}>
               {(['下方安全区', '上移 15%', '角标提示', '画面中央'] as CaptionPosition[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
             </ion-select>
-            <ion-input disabled={frozen} label="替代文本状态" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText ? '已填写' : '缺失'} readonly />
+            <ion-input disabled={frozen || practicing} label="替代文本状态" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText ? '已填写' : '缺失'} readonly />
           </div>
-          <ion-textarea disabled={frozen} autoGrow label="步骤字幕" labelPlacement="stacked" class="studio-input" value={step.caption} onIonInput={(event) => this.updateStep({ caption: event.detail.value ?? '' })} />
-          <ion-textarea disabled={frozen} autoGrow label="替代文本（必须描述动作与表情）" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText} onIonInput={(event) => this.updateStep({ altText: event.detail.value ?? '' })} />
+          <ion-textarea disabled={frozen || practicing} autoGrow label="步骤字幕" labelPlacement="stacked" class="studio-input" value={step.caption} onIonInput={(event) => this.updateStep({ caption: event.detail.value ?? '' })} />
+          <ion-textarea disabled={frozen || practicing} autoGrow label="替代文本（必须描述动作与表情）" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText} onIonInput={(event) => this.updateStep({ altText: event.detail.value ?? '' })} />
         </section>
 
         <section class="form-card">
           <div class="section-title"><span>04</span><div><h2>学习依赖与练习</h2><p>前置步骤、常见错误、练习任务与反馈</p></div></div>
           <div class="form-grid two">
-            <ion-select disabled={frozen} label="前置条件" labelPlacement="stacked" class="studio-input" value={step.prerequisiteId} onIonChange={(event) => this.updateStep({ prerequisiteId: event.detail.value ?? '' })}>
+            <ion-select disabled={frozen || practicing} label="前置条件" labelPlacement="stacked" class="studio-input" value={step.prerequisiteId} onIonChange={(event) => this.updateStep({ prerequisiteId: event.detail.value ?? '' })}>
               <ion-select-option value="">无前置条件</ion-select-option>
               {prerequisites.map((item) => <ion-select-option value={item.id}>{item.title}</ion-select-option>)}
             </ion-select>
-            <ion-input disabled={frozen} label="检查点（秒，用逗号分隔）" labelPlacement="stacked" class="studio-input" value={step.cuePoints.join(', ')} onIonInput={(event) => this.updateStep({ cuePoints: (event.detail.value ?? '').split(/[,，\s]+/).map(Number).filter((value) => Number.isFinite(value)) })} />
+            <ion-input disabled={frozen || practicing} label="检查点（秒，用逗号分隔）" labelPlacement="stacked" class="studio-input" value={step.cuePoints.join(', ')} onIonInput={(event) => this.updateStep({ cuePoints: (event.detail.value ?? '').split(/[,，\s]+/).map(Number).filter((value) => Number.isFinite(value)) })} />
           </div>
-          <ion-textarea disabled={frozen} autoGrow label="常见错误（每行一条）" labelPlacement="stacked" class="studio-input" value={step.commonMistakes.join('\n')} onIonInput={(event) => this.updateStep({ commonMistakes: (event.detail.value ?? '').split('\n').filter(Boolean) })} />
+          <ion-textarea disabled={frozen || practicing} autoGrow label="常见错误（每行一条）" labelPlacement="stacked" class="studio-input" value={step.commonMistakes.join('\n')} onIonInput={(event) => this.updateStep({ commonMistakes: (event.detail.value ?? '').split('\n').filter(Boolean) })} />
           <div class="form-grid two">
-            <ion-textarea disabled={frozen} autoGrow label="练习任务" labelPlacement="stacked" class="studio-input" value={step.exercise} onIonInput={(event) => this.updateStep({ exercise: event.detail.value ?? '' })} />
-            <ion-textarea disabled={frozen} autoGrow label="练习反馈" labelPlacement="stacked" class="studio-input" value={step.exerciseFeedback} onIonInput={(event) => this.updateStep({ exerciseFeedback: event.detail.value ?? '' })} />
+            <ion-textarea disabled={frozen || practicing} autoGrow label="练习任务" labelPlacement="stacked" class="studio-input" value={step.exercise} onIonInput={(event) => this.updateStep({ exercise: event.detail.value ?? '' })} />
+            <ion-textarea disabled={frozen || practicing} autoGrow label="练习反馈" labelPlacement="stacked" class="studio-input" value={step.exerciseFeedback} onIonInput={(event) => this.updateStep({ exerciseFeedback: event.detail.value ?? '' })} />
           </div>
         </section>
       </div>
@@ -507,7 +631,105 @@ export class AppRoot {
             <p class="preview-caption-text">{step.caption}</p>
           </div>
         ) : <div class="empty-preview">选择步骤后显示设备预览。</div>}
+        {step && this.renderPracticeCard(step)}
       </section>
+    );
+  }
+
+  private renderPracticeCard(step: LessonStep) {
+    const session = this.currentPractice;
+    const records = this.practiceRecords;
+    return (
+      <div class={`practice-card ${session ? 'active' : ''}`}>
+        <div class="practice-card-head">
+          <div>
+            <span class="eyebrow">步骤练习记录</span>
+            <h3>{session ? '练习进行中' : '课后练习记录'}</h3>
+          </div>
+          {session
+            ? <span class="practice-live-dot"><i />{this.formatDate(session.startedAt)} 开始</span>
+            : records.length > 0 && <span class="practice-count">最近 {records.length} / 5 次</span>}
+        </div>
+
+        {session ? this.renderActivePractice(session) : (
+          <div class="practice-idle">
+            <p>{step.cuePoints.length
+              ? `本步骤共有 ${step.cuePoints.length} 个检查点，开始后逐个记录「通过」或「待加强」，重复记录以最后一次为准。`
+              : '本步骤还没有检查点，请先在编辑区填写检查点秒数后再开始练习。'}</p>
+            <ion-button class="studio-button" disabled={!step.cuePoints.length} onClick={() => this.beginPractice()}>开始一次练习</ion-button>
+          </div>
+        )}
+
+        {records.length > 0 && (
+          <div class="practice-history">
+            <div class="practice-history-title">已结束的记录（保留最近五次）</div>
+            {records.map((record, index) => this.renderPracticeRecord(record, index))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  private renderActivePractice(session: PracticeSession) {
+    const marked = session.checkpoints.filter((checkpoint) => checkpoint.result !== null).length;
+    const weakWithoutTip = session.checkpoints.filter((checkpoint) => checkpoint.result === 'weak' && !checkpoint.tip.trim()).length;
+    const canFinish = canFinishPractice(session);
+    return (
+      <div class="practice-active">
+        <div class="practice-progress-line">
+          <span>{marked} / {session.checkpoints.length} 个检查点已记录</span>
+          {weakWithoutTip > 0 && <small class="practice-hint">{weakWithoutTip} 个「待加强」还需写当堂提示</small>}
+        </div>
+        <div class="checkpoint-list">
+          {session.checkpoints.map((checkpoint, index) => (
+            <div class={`checkpoint-row ${checkpoint.result ?? ''}`} key={`${checkpoint.cue}-${index}`}>
+              <div class="checkpoint-main">
+                <span class="checkpoint-cue">{checkpoint.cue}s</span>
+                <div class="checkpoint-toggle">
+                  <button class={checkpoint.result === 'pass' ? 'selected pass' : 'pass'} onClick={() => this.markCheckpoint(index, 'pass')}>✓ 通过</button>
+                  <button class={checkpoint.result === 'weak' ? 'selected weak' : 'weak'} onClick={() => this.markCheckpoint(index, 'weak')}>! 待加强</button>
+                </div>
+              </div>
+              <input
+                class="checkpoint-tip"
+                type="text"
+                value={checkpoint.tip}
+                placeholder={checkpoint.result === 'weak' ? '写一句当堂提示（必填）' : '可写一句当堂提示'}
+                onInput={(event) => this.updateCheckpointTip(index, (event.target as HTMLInputElement).value)}
+              />
+            </div>
+          ))}
+        </div>
+        <div class="practice-actions">
+          <ion-button fill="outline" color="medium" class="studio-button" onClick={() => this.abortPractice()}>放弃</ion-button>
+          <ion-button color="primary" class="studio-button" disabled={!canFinish} onClick={() => this.endPractice()}>结束本次记录</ion-button>
+        </div>
+        {!canFinish && <p class="practice-finish-hint">所有检查点都要记录结果，「待加强」项需补一句当堂提示，才能结束。</p>}
+      </div>
+    );
+  }
+
+  private renderPracticeRecord(record: PracticeSession, index: number) {
+    const passed = record.checkpoints.filter((checkpoint) => checkpoint.result === 'pass').length;
+    const weak = record.checkpoints.filter((checkpoint) => checkpoint.result === 'weak').length;
+    return (
+      <details class="practice-record" key={record.id}>
+        <summary>
+          <span class="record-index">第 {this.practiceRecords.length - index} 次</span>
+          <span class="record-time">{this.formatDate(record.endedAt ?? record.startedAt)} 结束</span>
+          <span class="record-summary"><b class="pass">{passed} 通过</b><b class="weak">{weak} 待加强</b></span>
+        </summary>
+        <div class="record-body">
+          <div class="record-title-line"><strong>{record.stepTitle}</strong><span>{this.formatDate(record.startedAt)} 开始</span></div>
+          {record.checkpoints.map((checkpoint, cueIndex) => (
+            <div class={`record-checkpoint ${checkpoint.result ?? ''}`} key={`${record.id}-${cueIndex}`}>
+              <span class="record-cue">{checkpoint.cue}s</span>
+              <span class="record-result">{checkpoint.result === 'pass' ? '✓ 通过' : '! 待加强'}</span>
+              <span class="record-tip">{checkpoint.tip.trim() || '—'}</span>
+            </div>
+          ))}
+        </div>
+      </details>
     );
   }
 

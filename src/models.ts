@@ -63,7 +63,107 @@ export interface ValidationCheck {
   moduleId?: string;
 }
 
+export interface PracticeCheckpoint {
+  cue: number;
+  result: 'pass' | 'weak' | null;
+  tip: string;
+}
+
+export interface PracticeSession {
+  id: string;
+  stepId: string;
+  stepTitle: string;
+  startedAt: string;
+  endedAt?: string;
+  checkpoints: PracticeCheckpoint[];
+}
+
+export type PracticeStore = Record<string, PracticeSession[]>;
+
 export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v1';
+export const PRACTICE_STORAGE_KEY = 'sologsb-1012-sign-course-practice-v1';
+export const PRACTICE_HISTORY_LIMIT = 5;
+
+export function createEmptyPracticeStore(): PracticeStore {
+  return {};
+}
+
+export function activePractice(store: PracticeStore, stepId: string): PracticeSession | undefined {
+  return store[stepId]?.find((session) => !session.endedAt);
+}
+
+export function practiceHistory(store: PracticeStore, stepId: string): PracticeSession[] {
+  return (store[stepId] ?? []).filter((session) => Boolean(session.endedAt)).slice(-PRACTICE_HISTORY_LIMIT).reverse();
+}
+
+export function hasAnyActivePractice(store: PracticeStore): boolean {
+  return Object.values(store).some((sessions) => sessions.some((session) => !session.endedAt));
+}
+
+export function startPractice(store: PracticeStore, step: LessonStep): PracticeStore {
+  const sessions = store[step.id] ?? [];
+  if (sessions.some((session) => !session.endedAt)) return store;
+  const session: PracticeSession = {
+    id: `practice-${Date.now().toString(36)}`,
+    stepId: step.id,
+    stepTitle: step.title,
+    startedAt: new Date().toISOString(),
+    checkpoints: step.cuePoints.map((cue) => ({ cue, result: null, tip: '' })),
+  };
+  return { ...store, [step.id]: [...sessions, session] };
+}
+
+export function setCheckpointResult(store: PracticeStore, stepId: string, index: number, result: PracticeCheckpoint['result']): PracticeStore {
+  return {
+    ...store,
+    [stepId]: (store[stepId] ?? []).map((session) => {
+      if (session.endedAt) return session;
+      const checkpoints = session.checkpoints.map((checkpoint, current) => current === index ? { ...checkpoint, result } : checkpoint);
+      return { ...session, checkpoints };
+    }),
+  };
+}
+
+export function setCheckpointTip(store: PracticeStore, stepId: string, index: number, tip: string): PracticeStore {
+  return {
+    ...store,
+    [stepId]: (store[stepId] ?? []).map((session) => {
+      if (session.endedAt) return session;
+      const checkpoints = session.checkpoints.map((checkpoint, current) => current === index ? { ...checkpoint, tip } : checkpoint);
+      return { ...session, checkpoints };
+    }),
+  };
+}
+
+export function canFinishPractice(session: PracticeSession): boolean {
+  return session.checkpoints.length > 0
+    && session.checkpoints.every((checkpoint) => checkpoint.result !== null)
+    && session.checkpoints.every((checkpoint) => checkpoint.result !== 'weak' || checkpoint.tip.trim().length > 0);
+}
+
+export function finishPractice(store: PracticeStore, stepId: string): PracticeStore {
+  const existing = store[stepId] ?? [];
+  if (!existing.some((session) => !session.endedAt)) return store;
+  const endedAt = new Date().toISOString();
+  const sessions = existing.map((session) => session.endedAt ? session : { ...session, endedAt });
+  const finished = sessions.filter((session) => session.endedAt).slice(-PRACTICE_HISTORY_LIMIT);
+  return { ...store, [stepId]: finished };
+}
+
+export function discardPractice(store: PracticeStore, stepId: string): PracticeStore {
+  const remaining = (store[stepId] ?? []).filter((session) => session.endedAt);
+  const next = { ...store };
+  if (remaining.length) next[stepId] = remaining;
+  else delete next[stepId];
+  return next;
+}
+
+export function removeStepPractice(store: PracticeStore, stepId: string): PracticeStore {
+  if (!store[stepId]) return store;
+  const next = { ...store };
+  delete next[stepId];
+  return next;
+}
 
 export function createDemoProject(): CourseProject {
   const modules: CourseModule[] = [
